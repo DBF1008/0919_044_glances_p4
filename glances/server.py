@@ -12,11 +12,12 @@ import fnmatch
 import json
 import socket
 import sys
+import threading
 from base64 import b64decode
 
 from defusedxml import xmlrpc
 
-from glances import __version__
+from glances import __version__, flush_stats_exports
 from glances.logger import logger
 from glances.processes import glances_processes
 from glances.servers_list_dynamic import GlancesAutoDiscoverClient
@@ -31,6 +32,17 @@ class GlancesXMLRPCHandler(xmlrpc.xmlrpc_server.SimpleXMLRPCRequestHandler):
     """Main XML-RPC handler."""
 
     rpc_paths = ('/RPC2',)
+
+    def setup(self):
+        # Track the connection for the graceful shutdown drain phase
+        super().setup()
+        self.server.connection_opened()
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            self.server.connection_closed()
 
     def end_headers(self):
         # Hack to add a specific header
@@ -122,6 +134,10 @@ class GlancesXMLRPCServer(xmlrpc.xmlrpc_server.SimpleXMLRPCServer):
         self.bind_port = bind_port
         self.config = config
 
+        # In-flight connections tracking (used by the graceful shutdown)
+        self._active_connections = 0
+        self._connections_lock = threading.Lock()
+
         # CORS origins (GHSA-87qc-fj39-wccr / CVE-2026-46608).
         # Stored as a list; the handler reflects the request Origin against it
         # per request. Default ["*"] preserves backward compatibility for the
@@ -149,10 +165,38 @@ class GlancesXMLRPCServer(xmlrpc.xmlrpc_server.SimpleXMLRPCServer):
 
         super().__init__((bind_address, bind_port), requestHandler)
 
+        # Poll interval (in seconds) so that serve_forever() can notice a
+        # shutdown request even when no request is received
+        self.timeout = 1
+
+    def connection_opened(self):
+        """Track a new in-flight connection."""
+        with self._connections_lock:
+            self._active_connections += 1
+
+    def connection_closed(self):
+        """Track the end of an in-flight connection."""
+        with self._connections_lock:
+            self._active_connections = max(0, self._active_connections - 1)
+
+    @property
+    def inflight_connections(self):
+        """Return the number of connections currently being served."""
+        with self._connections_lock:
+            return self._active_connections
+
+    def shutdown(self):
+        """Stop accepting new requests (graceful shutdown phase 1).
+
+        The serve_forever loop will return once the request currently
+        being processed (if any) is finished.
+        """
+        self.finished = True
+
     def end(self):
         """Stop the server"""
+        self.shutdown()
         self.server_close()
-        self.finished = True
 
     def serve_forever(self):
         """Main loop"""
@@ -220,6 +264,10 @@ class GlancesServer:
         # Args
         self.args = args
 
+        # Graceful shutdown flags
+        self._ended = False
+        self._stats_closed = False
+
         # Set the args for the glances_processes instance
         glances_processes.set_args(args)
 
@@ -261,7 +309,8 @@ class GlancesServer:
 
         # Register functions
         self.server.register_introspection_functions()
-        self.server.register_instance(GlancesInstance(config, args))
+        self.glances_instance = GlancesInstance(config, args)
+        self.server.register_instance(self.glances_instance)
 
         if not self.args.disable_autodiscover:
             # Note: The Zeroconf service name will be based on the hostname
@@ -276,6 +325,29 @@ class GlancesServer:
         self.server.user_dict[username] = password
         self.server.isAuth = True
 
+    def register_shutdown_hooks(self, manager):
+        """Register the graceful shutdown hooks in the GlancesShutdownManager."""
+        # Phase 1: stop accepting new XML-RPC requests
+        manager.register_stop_accepting(self.server.shutdown)
+        # Phase 2: wait for the in-flight XML-RPC connections to drain
+        manager.register_inflight_check(lambda: self.server.inflight_connections)
+        # Phase 3: flush the export buffers (do not lose the last batch)
+        manager.register_flusher(self.flush_exports)
+        # Phase 4: close the export/storage connections
+        manager.register_closer(self.close)
+
+    def flush_exports(self):
+        """Synchronously flush a final stats batch to all the export modules."""
+        if self._stats_closed:
+            return
+        flush_stats_exports(self.glances_instance.stats)
+
+    def close(self):
+        """Close the stats (export connections and plugins). Idempotent."""
+        if not self._stats_closed:
+            self._stats_closed = True
+            self.glances_instance.stats.end()
+
     def serve_forever(self):
         """Call the main loop."""
         # Set the server login/password (if -P/--password tag)
@@ -286,6 +358,10 @@ class GlancesServer:
 
     def end(self):
         """End of the Glances server session."""
+        if self._ended:
+            return
+        self._ended = True
         if not self.args.disable_autodiscover:
             self.autodiscover_client.close()
         self.server.end()
+        self.close()

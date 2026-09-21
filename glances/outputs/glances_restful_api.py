@@ -184,7 +184,7 @@ class GlancesUvicornServer(uvicorn.Server):
         pass
 
     @contextlib.contextmanager
-    def run_in_thread(self, timeout=3):
+    def run_in_thread(self, timeout=3, graceful_timeout=10):
         # daemon=True: if the main thread exits the process won't be kept alive
         # by a uvicorn thread blocked on a persistent connection (e.g. MCP/SSE).
         thread = threading.Thread(target=self.run, daemon=True)
@@ -202,17 +202,20 @@ class GlancesUvicornServer(uvicorn.Server):
             yield
         finally:
             self.should_exit = True
-            # Give uvicorn a brief window for graceful shutdown.
+            # Give uvicorn a graceful shutdown window so that in-flight HTTP
+            # requests and WebSocket connections can complete before the
+            # thread is stopped (force_exit is only used as a last resort).
             # Extra CTRL+C signals pressed during shutdown are absorbed so that
             # force_exit is always reached when there are lingering connections
             # (e.g. a MCP client holding an SSE connection open).
             # daemon=True above guarantees the process exits even if the thread
             # hasn't fully stopped by the time we leave this block.
             try:
-                thread.join(timeout=3)
+                thread.join(timeout=graceful_timeout)
             except KeyboardInterrupt:
                 pass
             if thread.is_alive():
+                logger.warning(f"Graceful shutdown timeout ({graceful_timeout}s) reached, forcing Web server exit")
                 self.force_exit = True
                 try:
                     thread.join(timeout=2)
@@ -235,6 +238,12 @@ class GlancesRestfulApi:
         # Init stats
         # Will be updated within route
         self.stats = None
+
+        # Uvicorn server instance (set by _start_uvicorn)
+        self.uvicorn_server = None
+
+        # Graceful shutdown flag
+        self._shutting_down = False
 
         # Init servers list (only for the browser mode)
         if self.args.browser:
@@ -506,6 +515,7 @@ class GlancesRestfulApi:
         router = APIRouter(prefix=self.url_prefix)
         router.add_api_route(f'{base_path}/status', self._api_status, methods=['HEAD'])
         router.add_api_route(f'{base_path}/status', self._api_status, methods=['GET'])
+        router.add_api_route(f'{base_path}/health', self._api_health, methods=['GET'])
         return router
 
     def _router(self) -> APIRouter:
@@ -669,6 +679,11 @@ class GlancesRestfulApi:
 
     def _start_uvicorn(self):
         # Run the Uvicorn Web server
+        # Use the graceful shutdown drain timeout configured in the
+        # GlancesShutdownManager (config file [outputs] shutdown_timeout)
+        from glances import shutdown_manager
+
+        drain_timeout = shutdown_manager.drain_timeout
         uvicorn_config = uvicorn.Config(
             self._app,
             host=self.args.bind_address,
@@ -676,6 +691,8 @@ class GlancesRestfulApi:
             access_log=self.args.debug,
             ssl_keyfile=self.ssl_keyfile,
             ssl_certfile=self.ssl_certfile,
+            # Let Uvicorn wait for in-flight connections during the drain phase
+            timeout_graceful_shutdown=int(drain_timeout) or None,
         )
         try:
             self.uvicorn_server = GlancesUvicornServer(config=uvicorn_config)
@@ -683,7 +700,7 @@ class GlancesRestfulApi:
             logger.critical(f'Error: Can not ran Glances Web server ({e})')
             self.uvicorn_server = None
         else:
-            with self.uvicorn_server.run_in_thread():
+            with self.uvicorn_server.run_in_thread(graceful_timeout=drain_timeout + 2):
                 while not self.uvicorn_server.should_exit:
                     time.sleep(1)
 
@@ -758,6 +775,103 @@ class GlancesRestfulApi:
         """
 
         return GlancesJSONResponse({'version': __version__})
+
+    def _api_health(self):
+        """Glances API RESTful implementation.
+
+        Return a JSON document with the readiness status of Glances:
+        - ready: Glances is running and accepting requests
+        - shutting_down: a graceful shutdown is in progress
+        - shutdown: Glances has been stopped
+
+        The response also includes the health of the main components:
+        plugins status, export connections status and process list
+        availability. A 503 status code is returned when Glances is not
+        ready anymore (so that load balancers stop routing requests).
+        """
+        from glances import shutdown_manager
+
+        components = {}
+
+        # Plugins status
+        plugins_status = {}
+        if self.stats is not None:
+            try:
+                for plugin_name in self.stats.getPluginsList():
+                    plugins_status[plugin_name] = 'ok'
+            except Exception as e:
+                logger.error(f"Health check: unable to retrieve plugins status: {e}")
+        components['plugins'] = {
+            'status': 'ok' if plugins_status else 'unavailable',
+            'count': len(plugins_status),
+            'plugins': plugins_status,
+        }
+
+        # Export connections status
+        exports_status = {}
+        if self.stats is not None:
+            exports_registry = getattr(self.stats, '_exports', {})
+            try:
+                for export_name in self.stats.getExportsList():
+                    export_module = exports_registry.get(export_name)
+                    connected = bool(getattr(export_module, 'export_enable', False))
+                    exports_status[export_name] = 'connected' if connected else 'disconnected'
+            except Exception as e:
+                logger.error(f"Health check: unable to retrieve exports status: {e}")
+        if not exports_status:
+            exports_health = 'disabled'
+        elif all(status == 'connected' for status in exports_status.values()):
+            exports_health = 'ok'
+        else:
+            exports_health = 'degraded'
+        components['exports'] = {
+            'status': exports_health,
+            'connections': exports_status,
+        }
+
+        # Process list availability
+        processes_total = None
+        processlist_available = False
+        if self.stats is not None:
+            try:
+                processcount = self.stats.get_plugin('processcount').get_raw()
+                processes_total = processcount.get('total')
+                processlist_available = processes_total is not None
+            except Exception as e:
+                logger.error(f"Health check: unable to retrieve process list status: {e}")
+        components['processlist'] = {
+            'status': 'ok' if processlist_available else 'unavailable',
+            'total': processes_total,
+        }
+
+        state = shutdown_manager.state
+        payload = {
+            'status': state,
+            'version': __version__,
+            'components': components,
+        }
+
+        return GlancesJSONResponse(payload, status_code=200 if state == 'ready' else 503)
+
+    def initiate_shutdown(self):
+        """Stop accepting new connections and start the Uvicorn graceful shutdown.
+
+        Called by the GlancesShutdownManager (phase 1). Uvicorn then stops
+        accepting new HTTP/WebSocket connections and waits for the in-flight
+        ones to complete (bounded by timeout_graceful_shutdown).
+        """
+        self._shutting_down = True
+        if self.uvicorn_server is not None:
+            self.uvicorn_server.should_exit = True
+
+    def inflight_connections(self):
+        """Return the number of in-flight HTTP/WebSocket connections."""
+        if self.uvicorn_server is None:
+            return 0
+        server_state = getattr(self.uvicorn_server, 'server_state', None)
+        if server_state is None:
+            return 0
+        return len(getattr(server_state, 'connections', None) or [])
 
     def _events_clear_warning(self):
         """Glances API RESTful implementation.

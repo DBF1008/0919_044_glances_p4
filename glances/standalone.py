@@ -11,6 +11,7 @@
 import sys
 import time
 
+from glances import flush_stats_exports
 from glances.globals import WINDOWS
 from glances.logger import logger
 from glances.outdated import Outdated
@@ -33,6 +34,11 @@ class GlancesStandalone:
     def __init__(self, config=None, args=None):
         self.config = config
         self.args = args
+
+        # Graceful shutdown flags
+        self._shutdown_requested = False
+        self._ended = False
+        self._stats_closed = False
 
         # Quiet mode
         self._quiet = args.quiet
@@ -124,6 +130,31 @@ class GlancesStandalone:
         print("Plugins list: {}".format(', '.join(sorted(self.stats.getPluginsList(enable=False)))))
         print("Exporters list: {}".format(', '.join(sorted(self.stats.getExportsList(enable=False)))))
 
+    def request_shutdown(self):
+        """Request the main loop to exit gracefully (called on SIGINT/SIGTERM)."""
+        self._shutdown_requested = True
+
+    def register_shutdown_hooks(self, manager):
+        """Register the graceful shutdown hooks in the GlancesShutdownManager."""
+        # Phase 1: stop the main loop (no new connections in standalone mode)
+        manager.register_stop_accepting(self.request_shutdown)
+        # Phase 3: flush the export buffers (do not lose the last batch)
+        manager.register_flusher(self.flush_exports)
+        # Phase 4: close the export/storage connections
+        manager.register_closer(self.close)
+
+    def flush_exports(self):
+        """Synchronously flush a final stats batch to all the export modules."""
+        if self._stats_closed:
+            return
+        flush_stats_exports(self.stats)
+
+    def close(self):
+        """Close the stats (export connections and plugins). Idempotent."""
+        if not self._stats_closed:
+            self._stats_closed = True
+            self.stats.end()
+
     def serve_issue(self):
         """Special mode for the --issue option
 
@@ -159,8 +190,14 @@ class GlancesStandalone:
             logger.debug(f'Stats display duration: {counter_display.get() - adapted_refresh} seconds')
         else:
             # Nothing is displayed
-            # Break should be done via a signal (CTRL-C)
-            time.sleep(adapted_refresh)
+            # Break is done via a signal (CTRL-C) setting the shutdown flag
+            # Sleep in small steps to stay responsive to shutdown requests
+            sleep_until = time.monotonic() + adapted_refresh
+            while not self._shutdown_requested:
+                remaining = sleep_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.5, remaining))
             ret = True
 
         # Export stats
@@ -183,17 +220,23 @@ class GlancesStandalone:
         if self.args.stop_after:
             self.serve_n(n=self.args.stop_after)
         else:
-            while self.__serve_once():
+            # Exit gracefully when a shutdown has been requested (SIGINT/SIGTERM)
+            # instead of breaking the loop abruptly
+            while not self._shutdown_requested and self.__serve_once():
                 pass
         # self.end()
 
     def end(self):
         """End of the standalone CLI."""
+        if self._ended:
+            return
+        self._ended = True
+
         if not self.quiet:
             self.screen.end()
 
-        # Exit from export modules
-        self.stats.end()
+        # Exit from export modules (may already be done by the shutdown manager)
+        self.close()
 
         # Check Glances version versus PyPI one
         if self.outdated.is_outdated() and 'unknown' not in self.outdated.installed_version():
