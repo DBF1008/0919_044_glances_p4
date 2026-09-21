@@ -14,6 +14,8 @@ import locale
 import platform
 import signal
 import sys
+import threading
+import time
 import tracemalloc
 
 # Global name
@@ -35,8 +37,130 @@ except ImportError:
 # Import Glances libs
 # Note: others Glances libs will be imported optionally
 from glances.logger import logger
-from glances.main import GlancesMain
 from glances.timer import Counter
+
+
+class GlancesShutdownManager:
+    """Coordinate a unified graceful shutdown across all Glances run modes.
+
+    The shutdown is split in ordered phases:
+      1. stop accepting new connections (HTTP / XML-RPC) or stop the
+         standalone main loop (via the mode stop flag)
+      2. wait for in-flight requests to drain (bounded by drain_timeout)
+      3. flush all export buffers (e.g. InfluxDB batch writer)
+      4. close storage connections
+
+    Modes register their own hooks through register_* methods. The manager
+    is a process-wide singleton (shutdown_manager) so that the REST API
+    /health endpoint can expose the current readiness state.
+    """
+
+    READY = 'ready'
+    SHUTTING_DOWN = 'shutting_down'
+    SHUTDOWN = 'shutdown'
+
+    def __init__(self, drain_timeout=5.0):
+        self.drain_timeout = float(drain_timeout)
+        self._state = self.READY
+        self._state_lock = threading.Lock()
+        self._stop_accepting_hooks = []
+        self._connection_trackers = []
+        self._flush_hooks = []
+        self._close_hooks = []
+
+    @property
+    def state(self):
+        """Current readiness state: ready / shutting_down / shutdown."""
+        return self._state
+
+    @property
+    def is_shutting_down(self):
+        return self._state != self.READY
+
+    def configure(self, drain_timeout=None):
+        """Configure the manager (called once from the start function)."""
+        if drain_timeout is not None:
+            self.drain_timeout = float(drain_timeout)
+
+    def register_stop_accepting(self, hook, name=''):
+        """Phase 1 hook: stop accepting new connections / stop the main loop."""
+        self._stop_accepting_hooks.append((name, hook))
+
+    def register_connection_tracker(self, tracker, name=''):
+        """Register a callable returning the number of in-flight connections."""
+        self._connection_trackers.append((name, tracker))
+
+    def register_flush(self, hook, name=''):
+        """Phase 3 hook: flush export buffers."""
+        self._flush_hooks.append((name, hook))
+
+    def register_close(self, hook, name=''):
+        """Phase 4 hook: close storage connections."""
+        self._close_hooks.append((name, hook))
+
+    def _run_hooks(self, hooks, phase):
+        for name, hook in hooks:
+            try:
+                hook()
+            except Exception as e:
+                logger.error(f"Graceful shutdown: error in {phase} hook '{name}': {e}")
+
+    def _active_connections(self):
+        active = 0
+        for name, tracker in self._connection_trackers:
+            try:
+                active += tracker()
+            except Exception as e:
+                logger.debug(f"Graceful shutdown: connection tracker '{name}' failed: {e}")
+        return active
+
+    def _wait_for_drain(self):
+        """Wait for in-flight requests to complete, bounded by drain_timeout."""
+        deadline = time.monotonic() + self.drain_timeout
+        while True:
+            active = self._active_connections()
+            if active <= 0:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"Graceful shutdown: {active} connection(s) still active "
+                    f"after {self.drain_timeout}s drain timeout, forcing shutdown"
+                )
+                return
+            logger.debug(f"Graceful shutdown: waiting for {active} in-flight connection(s)")
+            time.sleep(0.1)
+
+    def request_shutdown(self):
+        """Run the phased graceful shutdown. Idempotent."""
+        with self._state_lock:
+            if self._state != self.READY:
+                # Shutdown already in progress (or done)
+                return False
+            self._state = self.SHUTTING_DOWN
+
+        logger.info("Graceful shutdown: phase 1/4 - stop accepting new connections")
+        self._run_hooks(self._stop_accepting_hooks, 'stop_accepting')
+
+        logger.info(f"Graceful shutdown: phase 2/4 - drain in-flight requests (timeout {self.drain_timeout}s)")
+        self._wait_for_drain()
+
+        logger.info("Graceful shutdown: phase 3/4 - flush export buffers")
+        self._run_hooks(self._flush_hooks, 'flush')
+
+        logger.info("Graceful shutdown: phase 4/4 - close storage connections")
+        self._run_hooks(self._close_hooks, 'close')
+
+        with self._state_lock:
+            self._state = self.SHUTDOWN
+        return True
+
+
+# Process-wide shutdown manager singleton
+shutdown_manager = GlancesShutdownManager()
+
+# Deferred import: glances.main (and the modules it pulls in) may rely on the
+# shutdown_manager singleton defined above.
+from glances.main import GlancesMain  # noqa: E402
 
 # Check locale
 try:
@@ -57,6 +181,9 @@ def __signal_handler(sig, frame):
     logger.debug(f"Signal {sig} caught")
     # Avoid Glances hang when killing process with muliple CTRL-C See #3264
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # Unified graceful shutdown: stop accepting new connections, drain
+    # in-flight requests, flush export buffers and close storage connections
+    shutdown_manager.request_shutdown()
     end()
 
 
@@ -148,6 +275,18 @@ def start(config, args):
     # Init the mode
     logger.info(f"Start {GlancesMode.__name__} mode")
     mode = GlancesMode(config=config, args=args)
+
+    # Configure the unified graceful shutdown manager and let the current
+    # mode register its phase hooks (stop accepting / drain / flush / close)
+    drain_timeout = None
+    if config is not None:
+        try:
+            drain_timeout = config.get_float_value('outputs', 'shutdown_drain_timeout', default=None)
+        except (TypeError, ValueError):
+            drain_timeout = None
+    shutdown_manager.configure(drain_timeout=drain_timeout)
+    if hasattr(mode, 'register_shutdown_hooks'):
+        mode.register_shutdown_hooks(shutdown_manager)
 
     start_main_loop(args, start_duration)
     snapshot_begin = check_memleak(args, mode)

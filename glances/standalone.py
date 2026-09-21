@@ -34,6 +34,10 @@ class GlancesStandalone:
         self.config = config
         self.args = args
 
+        # Graceful shutdown flag: set by the shutdown manager (phase 1)
+        # so the serve loop exits cleanly instead of being interrupted
+        self._shutdown_requested = False
+
         # Quiet mode
         self._quiet = args.quiet
         self.refresh_time = args.time
@@ -124,6 +128,33 @@ class GlancesStandalone:
         print("Plugins list: {}".format(', '.join(sorted(self.stats.getPluginsList(enable=False)))))
         print("Exporters list: {}".format(', '.join(sorted(self.stats.getExportsList(enable=False)))))
 
+    def request_stop(self):
+        """Request a graceful stop of the standalone main loop.
+
+        Called by the shutdown manager (phase 1). The serve loop checks the
+        flag and exits after the current iteration instead of being broken.
+        """
+        logger.info("Graceful shutdown requested: standalone loop will stop after the current iteration")
+        self._shutdown_requested = True
+
+    def flush_exports(self):
+        """Flush export buffers synchronously (shutdown manager phase 3).
+
+        Run a final export round in the current thread so that batched
+        exporters (e.g. InfluxDB) do not lose their last batch of data.
+        """
+        for e in self.stats.getExportsList():
+            try:
+                logger.debug(f"Flush export buffer for the {e} module")
+                self.stats._exports[e].update(self.stats)
+            except Exception as e:
+                logger.error(f"Can not flush export buffer for the {e} module: {e}")
+
+    def register_shutdown_hooks(self, manager):
+        """Register the standalone mode hooks in the GlancesShutdownManager."""
+        manager.register_stop_accepting(self.request_stop, name='standalone')
+        manager.register_flush(self.flush_exports, name='standalone-exports')
+
     def serve_issue(self):
         """Special mode for the --issue option
 
@@ -174,7 +205,7 @@ class GlancesStandalone:
     def serve_n(self, n=1):
         """Serve n time."""
         for _ in range(n):
-            if not self.__serve_once():
+            if self._shutdown_requested or not self.__serve_once():
                 break
         # self.end()
 
@@ -183,7 +214,8 @@ class GlancesStandalone:
         if self.args.stop_after:
             self.serve_n(n=self.args.stop_after)
         else:
-            while self.__serve_once():
+            # Exit on the graceful shutdown flag rather than a brutal break
+            while not self._shutdown_requested and self.__serve_once():
                 pass
         # self.end()
 

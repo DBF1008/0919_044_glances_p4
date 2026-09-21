@@ -12,6 +12,7 @@ import fnmatch
 import json
 import socket
 import sys
+import threading
 from base64 import b64decode
 
 from defusedxml import xmlrpc
@@ -122,6 +123,11 @@ class GlancesXMLRPCServer(xmlrpc.xmlrpc_server.SimpleXMLRPCServer):
         self.bind_port = bind_port
         self.config = config
 
+        # In-flight connections tracking (used to drain requests during
+        # the graceful shutdown phase 2)
+        self._active_connections = 0
+        self._connections_lock = threading.Lock()
+
         # CORS origins (GHSA-87qc-fj39-wccr / CVE-2026-46608).
         # Stored as a list; the handler reflects the request Origin against it
         # per request. Default ["*"] preserves backward compatibility for the
@@ -148,6 +154,38 @@ class GlancesXMLRPCServer(xmlrpc.xmlrpc_server.SimpleXMLRPCServer):
             sys.exit(1)
 
         super().__init__((bind_address, bind_port), requestHandler)
+
+        # Poll timeout for handle_request so the serve_forever loop can
+        # notice the finished flag set by shutdown() within ~0.5s
+        self.timeout = 0.5
+
+    @property
+    def active_connections(self):
+        """Number of requests currently being served."""
+        with self._connections_lock:
+            return self._active_connections
+
+    def process_request(self, request, client_address):
+        with self._connections_lock:
+            self._active_connections += 1
+        super().process_request(request, client_address)
+
+    def close_request(self, request):
+        try:
+            super().close_request(request)
+        finally:
+            with self._connections_lock:
+                self._active_connections -= 1
+
+    def shutdown(self):
+        """Graceful shutdown: stop accepting new requests.
+
+        The serve_forever loop exits on the finished flag; in-flight
+        requests are drained by the shutdown manager (phase 2) before
+        end() closes the listening socket.
+        """
+        logger.info("XML-RPC server shutdown requested: stop accepting new requests")
+        self.finished = True
 
     def end(self):
         """Stop the server"""
@@ -261,7 +299,8 @@ class GlancesServer:
 
         # Register functions
         self.server.register_introspection_functions()
-        self.server.register_instance(GlancesInstance(config, args))
+        self.instance = GlancesInstance(config, args)
+        self.server.register_instance(self.instance)
 
         if not self.args.disable_autodiscover:
             # Note: The Zeroconf service name will be based on the hostname
@@ -275,6 +314,21 @@ class GlancesServer:
         """Add an user to the dictionary."""
         self.server.user_dict[username] = password
         self.server.isAuth = True
+
+    def flush_exports(self):
+        """Flush export buffers synchronously (shutdown manager phase 3)."""
+        for e in self.instance.stats.getExportsList():
+            try:
+                logger.debug(f"Flush export buffer for the {e} module")
+                self.instance.stats._exports[e].update(self.instance.stats)
+            except Exception as e:
+                logger.error(f"Can not flush export buffer for the {e} module: {e}")
+
+    def register_shutdown_hooks(self, manager):
+        """Register the server mode hooks in the GlancesShutdownManager."""
+        manager.register_stop_accepting(self.server.shutdown, name='xmlrpc-server')
+        manager.register_connection_tracker(lambda: self.server.active_connections, name='xmlrpc-server')
+        manager.register_flush(self.flush_exports, name='xmlrpc-exports')
 
     def serve_forever(self):
         """Call the main loop."""

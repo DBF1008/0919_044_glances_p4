@@ -16,7 +16,7 @@ import webbrowser
 from typing import Annotated, Any
 from urllib.parse import urljoin
 
-from glances import __apiversion__, __version__
+from glances import __apiversion__, __version__, shutdown_manager
 from glances.events_list import glances_events
 from glances.globals import json_dumps
 from glances.logger import logger
@@ -180,11 +180,16 @@ class GlancesJSONResponse(JSONResponse):
 
 
 class GlancesUvicornServer(uvicorn.Server):
+    # Graceful shutdown window (seconds) used when joining the server thread
+    shutdown_timeout = 3
+
     def install_signal_handlers(self):
         pass
 
     @contextlib.contextmanager
-    def run_in_thread(self, timeout=3):
+    def run_in_thread(self, timeout=3, shutdown_timeout=None):
+        if shutdown_timeout is not None:
+            self.shutdown_timeout = shutdown_timeout
         # daemon=True: if the main thread exits the process won't be kept alive
         # by a uvicorn thread blocked on a persistent connection (e.g. MCP/SSE).
         thread = threading.Thread(target=self.run, daemon=True)
@@ -209,7 +214,7 @@ class GlancesUvicornServer(uvicorn.Server):
             # daemon=True above guarantees the process exits even if the thread
             # hasn't fully stopped by the time we leave this block.
             try:
-                thread.join(timeout=3)
+                thread.join(timeout=self.shutdown_timeout)
             except KeyboardInterrupt:
                 pass
             if thread.is_alive():
@@ -506,6 +511,7 @@ class GlancesRestfulApi:
         router = APIRouter(prefix=self.url_prefix)
         router.add_api_route(f'{base_path}/status', self._api_status, methods=['HEAD'])
         router.add_api_route(f'{base_path}/status', self._api_status, methods=['GET'])
+        router.add_api_route(f'{base_path}/health', self._api_health, methods=['GET'])
         return router
 
     def _router(self) -> APIRouter:
@@ -676,6 +682,9 @@ class GlancesRestfulApi:
             access_log=self.args.debug,
             ssl_keyfile=self.ssl_keyfile,
             ssl_certfile=self.ssl_certfile,
+            # Let uvicorn drain in-flight HTTP requests and WebSocket
+            # connections gracefully before forcing the exit
+            timeout_graceful_shutdown=max(1, int(shutdown_manager.drain_timeout)),
         )
         try:
             self.uvicorn_server = GlancesUvicornServer(config=uvicorn_config)
@@ -683,9 +692,29 @@ class GlancesRestfulApi:
             logger.critical(f'Error: Can not ran Glances Web server ({e})')
             self.uvicorn_server = None
         else:
-            with self.uvicorn_server.run_in_thread():
+            with self.uvicorn_server.run_in_thread(shutdown_timeout=max(3, int(shutdown_manager.drain_timeout))):
                 while not self.uvicorn_server.should_exit:
                     time.sleep(1)
+
+    def stop(self):
+        """Stop accepting new connections (shutdown manager phase 1).
+
+        Uvicorn then drains in-flight HTTP requests and WebSocket
+        connections itself within the graceful shutdown timeout.
+        """
+        if self.uvicorn_server is not None:
+            logger.info("Web server shutdown requested: stop accepting new connections")
+            self.uvicorn_server.should_exit = True
+
+    @property
+    def active_connections(self):
+        """Number of HTTP/WebSocket connections currently tracked by uvicorn."""
+        if self.uvicorn_server is None:
+            return 0
+        try:
+            return len(self.uvicorn_server.server_state.connections)
+        except AttributeError:
+            return 0
 
     def end(self):
         """End the Web server"""
@@ -758,6 +787,57 @@ class GlancesRestfulApi:
         """
 
         return GlancesJSONResponse({'version': __version__})
+
+    def _api_health(self):
+        """Glances API RESTful implementation.
+
+        Return the readiness state of the Glances process:
+          - ready:         serving requests normally (HTTP 200)
+          - shutting_down: graceful shutdown in progress (HTTP 503)
+          - shutdown:      shutdown completed (HTTP 503)
+
+        The response also embeds per-component health information:
+        plugins status, export connections status and process list
+        availability.
+        """
+        state = shutdown_manager.state
+
+        components = {}
+
+        # Plugins status
+        try:
+            components['plugins'] = {
+                'status': 'ok',
+                'total': len(self.stats.getPluginsList(enable=False)),
+                'enabled': len(self.stats.getPluginsList(enable=True)),
+            }
+        except Exception as e:
+            logger.debug(f"Health check: can not get plugins status: {e}")
+            components['plugins'] = {'status': 'error'}
+
+        # Export connections status
+        try:
+            components['exports'] = {'status': 'ok', 'enabled': self.stats.getExportsList()}
+        except Exception as e:
+            logger.debug(f"Health check: can not get exports status: {e}")
+            components['exports'] = {'status': 'error'}
+
+        # Process list availability
+        try:
+            processlist = glances_processes.processlist
+            components['processlist'] = {
+                'status': 'ok',
+                'available': processlist is not None,
+                'count': len(processlist) if processlist is not None else 0,
+            }
+        except Exception as e:
+            logger.debug(f"Health check: can not get process list status: {e}")
+            components['processlist'] = {'status': 'error', 'available': False}
+
+        return GlancesJSONResponse(
+            {'status': state, 'components': components},
+            status_code=status.HTTP_200_OK if state == shutdown_manager.READY else status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
     def _events_clear_warning(self):
         """Glances API RESTful implementation.

@@ -9,6 +9,7 @@
 """Glances Restful/API and Web based interface."""
 
 from glances.globals import WINDOWS
+from glances.logger import logger
 from glances.outputs.glances_restful_api import GlancesRestfulApi
 from glances.processes import glances_processes
 from glances.stats import GlancesStats
@@ -37,6 +38,25 @@ class GlancesWebServer:
     def serve_forever(self):
         """Main loop for the Web server."""
         self.web.start(self.stats)
+
+    def flush_exports(self):
+        """Flush export buffers synchronously (shutdown manager phase 3)."""
+        for e in self.stats.getExportsList():
+            try:
+                self.stats._exports[e].update(self.stats)
+            except Exception as e:
+                logger.error(f"Can not flush export buffer for the {e} module: {e}")
+
+    def register_shutdown_hooks(self, manager):
+        """Register the Web server mode hooks in the GlancesShutdownManager.
+
+        Phase 1 asks uvicorn to stop accepting new connections (it drains
+        in-flight HTTP requests and WebSocket connections itself); phase 2
+        tracks the remaining open connections.
+        """
+        manager.register_stop_accepting(self.web.stop, name='webserver')
+        manager.register_connection_tracker(lambda: self.web.active_connections, name='webserver')
+        manager.register_flush(self.flush_exports, name='webserver-exports')
 
     def end(self):
         """End of the Web server."""
